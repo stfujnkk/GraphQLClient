@@ -1,0 +1,2 @@
+# GraphQLClient
+GraphQLClient for python
