@@ -1,11 +1,10 @@
-from typing import (
-    Dict,
-    Any,
-)
+from typing import (Dict, Any, Tuple)
 import keyword
+import os
 
-WORK_DIR = 'test'
-SCHEMA_PATH = 'shopify.schema.json'
+root = os.path.realpath(os.path.join(os.path.dirname(__file__), '..'))
+WORK_DIR = f'{root}/build'
+SCHEMA_PATH = f'{root}/tests/shopify.schema.json'
 CLASS_FIELDS_DICT = {}
 
 
@@ -38,8 +37,11 @@ def visit_arg(data: Dict[str, Any]) -> str:
     if arg_type.endswith(',None]'):
         arg_type = arg_type[6:-6]
         default_value = 'None'
-    arg_str = f"{data['name']}:{arg_type}"
-    if data['defaultValue']:
+    name = data['name']
+    if name in keyword.kwlist:
+        name += '_'
+    arg_str = f"{name}:{arg_type}"
+    if default_value:
         if default_value == 'false':
             arg_str += "=False"
         elif default_value == 'true':
@@ -51,17 +53,14 @@ def visit_arg(data: Dict[str, Any]) -> str:
     return arg_str
 
 
-def visit_description(description: str, indent: int) -> str:
+def visit_arg_description(data: Dict[str, Any]) -> Tuple[str, list]:
+    description: str = data['description']
     if not description:
-        return ''
-    gap = '\t' * indent
-    gap = f"\n\n{gap}"
-    return gap.join(x.strip() for x in description.split('\n'))
-
-
-def visit_arg_description(data: Dict[str, Any]) -> str:
-    description = visit_description(data['description'], 4)
-    return f"\t\t\t{data['name']}: {description}"
+        return None, None
+    name = data['name']
+    if name in keyword.kwlist:
+        name += '_'
+    return name, [x.strip() for x in description.split('\n')]
 
 
 def visit_field(data: Dict[str, Any], excludes: set) -> str:
@@ -173,39 +172,95 @@ def visit_type(data: Dict[str, Any], is_config) -> str:
     raise Exception(f'unknow kind {kind}')
 
 
-def visit_config_field(data: Dict[str, Any], excludes: set) -> str:
-    name = data['name']
-    if name in excludes:
-        return ''
-    description_ext = ''
-    field_type = get_config_type(data['type'])
+def parse_func(data: Dict[str, Any]) -> Dict[str, Any]:
     args = data.get('args')
+    name = data['name']
+    args_description = {}
+    deprecated = ''
+    return_type = ''
+    if 'type' in data:
+        return_type = get_config_type(data['type'])
+    args_list = []
     if args:
-        args_list = f'_config:{field_type},*,'
         args_list2 = []
         for arg in (visit_arg(x) for x in args):
             if arg.find('=') > 0:
                 args_list2.append(arg)
                 continue
-            args_list += f"{arg},"
-        if args_list2:
-            args_list += ','.join(args_list2)
-        else:
-            args_list = args_list[:-1]
-        field_str = '\t@staticmethod\n'
-        field_type = 'None'
-        description_ext = '\n\n\t\tArgs:\n'
-        description_ext += '\n'.join(visit_arg_description(x) for x in args)
-    else:
-        field_str = '\t@property\n'
-        args_list = 'self'
+            args_list.append(arg)
+        args_list.extend(args_list2)
+
+        for x in args:
+            k, v = visit_arg_description(x)
+            if k:
+                args_description[k] = v
     if data.get('isDeprecated'):
-        field_str += f"\t@deprecated(reason='''{data['deprecationReason']}''')\n"
+        deprecated = f"@deprecated(reason='''{data['deprecationReason']}''')"
     if name in keyword.kwlist:
         name += '_'
-    field_str += f"\tdef {name}({args_list}) -> {field_type}:\n"
-    if data['description']:
-        field_str += f"\t\t'''{data['description']}{description_ext}'''\n"
+    return {
+        'args_list': args_list,
+        'type': return_type,
+        'args_description': args_description,
+        'func_description': data['description'],
+        'func_name': name,
+        'deprecated': deprecated
+    }
+
+
+def get_func_description(
+    args_description: dict,
+    func_description: str,
+    indent=0,
+) -> str:
+    indent_str = '\t' * indent
+    args_descp = ''
+    for k, v in args_description.items():
+        v = f'\n{indent_str}\t\t\t'.join(v)
+        args_descp += f"\n{indent_str}\t\t{k}:{v}"
+    if args_descp:
+        args_descp = f'\n{indent_str}\tArgs:{args_descp}'
+    return f"{indent_str}\t'''{func_description}{args_descp}'''\n"
+
+
+def visit_config_field(data: Dict[str, Any], excludes: set) -> str:
+    """
+    This is an example of Google style.
+    
+    Args:
+        param1: This is the first param.
+    
+    Returns:
+        This is a description of what is returned.
+    
+    Raises:
+        This is a description of what is returned.
+    """
+    name = data['name']
+    if name in excludes:
+        return ''
+    func_config = parse_func(data)
+    field_str = ''
+    args_list = func_config['args_list']
+    return_type = func_config['type']
+    if not args_list:
+        field_str += '\t@property\n'
+        args_list = ['self']
+    else:
+        args_list = [f'_config:{return_type}', '*', *args_list]
+        field_str += '\t@staticmethod\n'
+        return_type = 'None'
+    if func_config['deprecated']:
+        field_str += f"\t{func_config['deprecated']}\n"
+
+    args_list = ','.join(args_list)
+    field_str += f"\tdef {func_config['func_name']}({args_list}) -> {return_type}:\n"
+    description = get_func_description(
+        func_config['args_description'],
+        func_config['func_description'],
+        indent=1,
+    )
+    field_str += description
     field_str += "\t\t...\n"
     return field_str
 
@@ -229,12 +284,12 @@ def visit_config(data: Dict[str, Any]) -> str:
 import ijson
 
 fo = open(f'{WORK_DIR}/common.py', 'w', encoding='utf8')
-fo.write('''
-import abc
+fo.write('''import abc
 from typing import (
     List,
     NewType,
     Union,
+    Any,
 )
 
 AccountNumber = NewType('AccountNumber', str)
@@ -424,6 +479,23 @@ def parse_gql_config(config) -> str:
         rst += f"{{{' '.join(fields)}}}"
     return rst
 
+def directive_impl(
+    payload: Union[_GQLConfig, dict],
+    directive: str,
+    **kwargs,
+):
+    data = {}
+    for k, v in kwargs.items():
+        key = f'${k}'
+        if key.endswith('_'):
+            key = key[:-1]
+        data[key] = v
+    if isinstance(payload, _GQLConfig):
+        payload._data[f'@{directive}'] = data
+    else:
+        payload[f'@{directive}'] = data
+    pass
+
 ''')
 fo.close()
 fo = open(f'{WORK_DIR}/shopifygql.pyi', 'w', encoding='utf8')
@@ -452,10 +524,27 @@ with open(SCHEMA_PATH, 'r', encoding='utf8') as fi:
         fo.write(visit_type(typ, False))
         fo.write('\n')
 
+with open(SCHEMA_PATH, 'r', encoding='utf8') as fi:
+    for directive in ijson.items(fi, '__schema.directives.item'):
+        conf = parse_func(directive)
+        args_list = conf['args_list']
+        args_list = ','.join(args_list)
+        directive_str = f"def {conf['func_name']}(payload:Any, *, {args_list})->None:\n"
+
+        args_description: dict = conf['args_description']
+        args_descp = ''
+        for k, v in args_description.items():
+            v = '\n\t\t\t'.join(v)
+            args_descp += f"\n\t\t{k}:{v}"
+        if args_descp:
+            args_descp = '\n\tArgs:' + args_descp
+        directive_str += f"\t'''{conf['func_description']}{args_descp}'''\n"
+        config_file.write(directive_str)
+
 #### 生成py文件
 
 config_file = open(f'{WORK_DIR}/config.py', 'w', encoding='utf8')
-config_file.write('from .common import _GQLConfig,NewType\n')
+config_file.write('from .common import _GQLConfig,NewType,directive_impl\n')
 
 with open(SCHEMA_PATH, 'r', encoding='utf8') as fi:
     for typ in ijson.items(fi, '__schema.types.item'):
@@ -481,3 +570,10 @@ with open(SCHEMA_PATH, 'r', encoding='utf8') as fi:
             # return visit_intertface(data)
         config_file.write(cls_str)
         config_file.write('\n')
+
+with open(SCHEMA_PATH, 'r', encoding='utf8') as fi:
+    for directive in ijson.items(fi, '__schema.directives.item'):
+        conf = parse_func(directive)
+        config_file.write(
+            f'''def {conf['func_name']}(payload, **kwargs):\n\tdirective_impl(payload, '{directive['name']}', **kwargs)\n'''
+        )
